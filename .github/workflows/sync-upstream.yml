@@ -1,0 +1,65 @@
+name: Sync Upstream Daily
+
+on:
+  schedule:
+    # 台灣時間 (UTC+8) 每日 00:00 (16:00 UTC), 02:00 (18:00 UTC), 06:00 (22:00 UTC)
+    - cron: '0 16 * * *'
+    - cron: '0 18 * * *'
+    - cron: '0 22 * * *'
+  workflow_dispatch: # 支援在 GitHub 網頁上手動點擊立即同步
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/walterLiu168/tw-invest-suite.git || true
+          git fetch upstream --prune
+
+      - name: Sync gh-pages (全市場分析與網頁數據)
+        run: |
+          echo "==== 檢查 upstream/gh-pages ===="
+          UPSTREAM_PAGES=$(git rev-parse upstream/gh-pages 2>/dev/null || echo "")
+          LOCAL_PAGES=$(git rev-parse origin/gh-pages 2>/dev/null || echo "")
+          echo "Upstream commit: $UPSTREAM_PAGES"
+          echo "Local commit:    $LOCAL_PAGES"
+
+          if [ -n "$UPSTREAM_PAGES" ]; then
+            if [ "$UPSTREAM_PAGES" != "$LOCAL_PAGES" ]; then
+              echo "偵測到上游有最新分析報告，正在強制同步至 gh-pages 分支..."
+              git push origin upstream/gh-pages:refs/heads/gh-pages --force
+              echo "✅ gh-pages 分支已成功更新，GitHub Pages 將自動重新部署！"
+            else
+              echo "✅ gh-pages 已是最新版本，無需更新。"
+            fi
+          else
+            echo "⚠️ 未能取得 upstream/gh-pages"
+          fi
+
+      - name: Sync main branch (程式碼更新)
+        run: |
+          echo "==== 檢查 upstream/main ===="
+          UPSTREAM_MAIN=$(git rev-parse upstream/main 2>/dev/null || echo "")
+          LOCAL_MAIN=$(git rev-parse origin/main 2>/dev/null || echo "")
+
+          if [ -n "$UPSTREAM_MAIN" ] && [ "$UPSTREAM_MAIN" != "$LOCAL_MAIN" ]; then
+            echo "合併上游最新程式碼..."
+            git merge upstream/main --no-edit -X ours || echo "已保留本機工作流程設定"
+            git push origin main || echo "main 分支已推送"
+          else
+            echo "✅ main 分支已是最新版本。"
+          fi
