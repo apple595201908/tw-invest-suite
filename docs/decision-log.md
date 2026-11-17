@@ -331,3 +331,150 @@ dy_pct = dy if dy > 0.5 else dy * 100
 - Build-Thesis 也是用同樣邏輯（🟢 多頭 = 紅、🔴 空頭 = 綠）— 在 thesis 訊息也用
 - 截圖確認 patterns.html 上 8039 當日 +9.22% 是紅、long_drawdown 表 -73.57% 是綠
 
+---
+
+## D016: 先修量測再談模型；重訓 NO-GO
+
+**日期**：2026-11-11
+
+**Context**:
+2026-11-11 被問「should we train again?」。production bundle `daily2_xgboost_20260620182039`
+訓練於 2026-06-20，train window 只有 2025 一年。但重新量測時發現 forward-validation ledger
+本身有四個靜默缺陷（只追 ADD、每天只寫最新預測日、品質退化列被靜默丟棄、`ledger_origin` 全無資訊），
+所以「5 個月的 OOS 證據」其實只有 23～26 個訊號日。在這種基礎上討論要不要重訓是沒有意義的。
+
+**Decision**:
+1. 先做 Phase 0（量測修復），再做 Phase 1（診斷），**重訓最後考慮且目前 NO-GO**。
+2. ledger 改為追蹤全部三種動作、補回被跳過的預測日、品質退化列記錄並標記而非丟棄、
+   `ledger_origin` 依真實發布延遲推導、`summary.json` 加 `by_action` 與 `coverage`。
+3. 沒有預測列的 38 個交易日（2026-07-08~09-24）**不重建**，只宣告為缺口。
+4. 診斷結論：模型接近 beta、沒有穩定 edge；**價值被「發佈廣度」破壞**——
+   整份清單輸宇宙 1.22pp，縮到 50～100 檔就贏 0.7～1.4pp；閘門開最大時市場廣度最低。
+5. 因此下一步優先順序是：**縮減發佈廣度 → 退化日保護 → 閘門市場相對 → 移除反向的
+   `pred_net_return >= 0` 條件**，全部排在重訓之前。
+
+**Why**:
+- 量測壞掉時，任何模型結論都只是在雜訊上做決策；ledger 從 8,160 列修到 36,522 列、
+  26 天修到 35 天之後，GO／NO-GO 的四項條件才有辦法真的檢查
+- 四項 GO 條件全 FAIL（連續量測 ≥60 天 FAIL、勝率贏宇宙 ≥+3pp FAIL、
+  報酬贏宇宙 ≥+0.5% FAIL、贏過自己的 HOLD 基準 FAIL）→ 現在重訓是把雜訊當真相
+- split-half 驗證顯示沒有任何替代排序規則穩健地贏過現行閘門 → 該修的是廣度與閘門，不是排序
+- `breadth_above_sma54` 對「模型有沒有 edge」的相關性 +0.647，是已知最強的單一因子 →
+  閘門市場相對化比換模型更有杠杆
+
+**Trade-off**:
+- 縮減發佈廣度、改閘門屬於**線上策略變更**，必須 Walter 明確授權，不能自行套用
+- 38 天的空白永遠補不回來 → 「模型在 7～9 月表現如何」目前無法回答
+- `pred_net_return` 反向的成因尚未定位（特徵漂移？標籤定義？市場狀態特徵主導？），
+  目前只證明「在這段期間、在 ADD 書內反向」
+
+**驗證**:
+- 20 個測試通過；向量化 outcome 更新 vs 原本逐列實作 cell-by-cell 0 差異（5,207 列 × 8 欄）
+- 重建驗收：原有 8,160 列 0 遺失、0 訊號或已完成報酬被改寫；連續兩次回填 byte-identical
+- 效能：日常 7.5 秒、全量回填 10.3 秒（原本 143 秒，超過 cron 的 120 秒預算 → 已修）
+- 詳見 `docs/RESP-2026-11-11-01-model-health-and-retrain-verdict.md`
+
+---
+
+## D017: 重訓前必須先把特徵覆蓋率拉平（train/serve skew）
+
+**日期**：2026-11-12
+
+**Context**:
+D016 的 NO-GO 建立在「證據量不足 + 四項 GO 條件全 FAIL」上，隔天解剖凍結 bundle 與各來源表後，
+找到真正的根因：**chip 特徵家族的訓練／服務分布錯配**。
+
+`stock_chip_features_daily` 的 `data_source` 欄位顯示：
+2020-01-02～2026-06-11 整段歷史都建自 `daily_data2`（每日只有 271 檔，佔宇宙 11.4%），
+2026-06-12 起改用 `daily_data2_full`（每日 ~2,380 檔，99.1%），**歷史從未回填**。
+模型的 train 與 validation 視窗覆蓋率是 11.3～11.4%，live 視窗是 59.3%（逐日可為 99% 或 0%），
+而模型上線日 2026-06-18 是覆蓋率暴增後的第 6 天。
+
+**Decision**:
+1. **重訓不是第一步**，且必須是「條件式 GO」：先把特徵管線修好並回填，再重訓。
+2. 必要前置 P1～P4：
+   - P1 修 chip 特徵建置器的來源表（整段歷史用 `daily_data2_full`）
+   - P2 回填 2020-01～2026-06-11 的 chip 特徵，覆蓋率 ≥95%
+   - P3 補 `us_anchor_features_daily` 2026-06～09 缺的 58 個交易日
+   - P4 覆蓋率守門：推論當日覆蓋率偏離訓練基準就不發布 ADD 訊號（fail-closed）
+3. 重訓推廣門檻把「40 筆交易的 ROI」換掉：交易數 ≥200、橫截面 AUC ≥0.56、
+   市場相對 purged OOS、且需設計凍結後 ≥40 個新交易日的前瞻驗證。
+4. 閘門改版（縮減廣度、退化日保護、市場相對化、移除反向的 `pred_net_return ≥ 0`）
+   與權重無關，可以並行，而且回報更快。
+5. 同時承認：**模型本質是市場計時器**——三個 `p_win` head 的 Top-1 都是全市場的
+   `breadth_above_sma54`，市場狀態特徵佔各 head gain 的 19.8～29.6%，
+   七個 head 特徵重疊度 0.78～0.85。重訓能帶來穩定性，帶不來橫截面選股能力。
+
+**Why**:
+- chip 家族 30+ 欄位的輸入分布在訓練與服務之間完全不同；XGBoost 對 NaN 有原生處理，
+  所以「某族特徵從 11% 覆蓋變 99%」不是漸變而是全帳輸出分布整體位移。
+  實測對應：2026-07-31 chip 整表無列 → ADD 佔比 86.0%；2026-10-28／11-02 缺 41 個新聞特徵
+  → 83.1%／95.3%；34 個乾淨日平均只有 24.3%。**管線故障會變成極度看多的訊號書。**
+- 訓練與驗證覆蓋率一致，所以只訓練不會暴露這個問題；模型是第一次在 99% 覆蓋的世界上運行。
+- `chip_cov ↔ ADD佔比` Spearman −0.626；`品質收據缺特徵數 ↔ ADD佔比` Pearson +0.499。
+- 不先修管線就重訓，只會產出同一個錯配的複製品。
+
+**Trade-off**:
+- P1～P3 是資料管線工程，需要時間與對上游資料保留期限的確認
+- 新的 bundle 在拿到 ≥40 個新鮮前瞻交易日之前**不能推廣**，所以這是一條有時限的路線
+- 「模型是市場計時器」意味著若產品定位是每日選股清單，需要重新思考模型在產品中的角色
+
+**驗證**:
+- 覆蓋率與轉換點：`scripts/_debug/_coverage_transition.py`
+- 覆蓋率 vs 閘門寬度：`scripts/_debug/_coverage_vs_gate.py`
+- bundle 各 head 的 gain 結構：`scripts/_debug/_bundle_anatomy.py`
+- 詳見 `docs/RESP-2026-11-12-01-retrain-root-cause-and-terms.md`
+
+---
+
+## D018: 選股清單歷史回看（watchlist history）
+
+**日期**：2026-11-16
+
+**Context**:
+每日精選 24 檔每晚整份換掉，任何網頁都只能回答「現在榜上有哪些」，
+永遠回答不了「這檔上次進榜是什麼時候、理由是什麼、之後賺賠如何」。
+既有資料其實都在：`market_screen_picks` 保留每次入選的 score／rationale／bucket／
+close_at_pick，`daily_data2_full` 有正規收盤價，只是沒有被組織成可查詢的歷史。
+
+**Decision**:
+1. 新增 `src/watchlist_history.py`：讀 `market_screen_runs` + `market_screen_picks` +
+   `daily_data2_full` → 產生單一緊湊文件 `public/data/watchlist-history.json`
+   （每檔含首次／最後進榜、上榜次數、每次入選明細、首次進榜後的每日報酬路徑）。
+2. 新增靜態頁 `public/watchlist-history.html`：總覽表（可搜尋／篩選／排序）+
+   點列下鑽該檔時間軸與報酬圖 + `?ticker=` 深層連結；顏色沿用台股慣例（紅漲綠跌）。
+3. nightly stage 7（`src/all_reports.py`）每次重建歷史文件，
+   `scripts/pipeline_state.py` 的認證白名單同步加入兩個新產物，
+   `scripts/render_full_watchlist.py` 每張 pick 卡加「📜 歷史 →」連結。
+4. 理由文字在建置時解析成結構化欄位（原本是 `**欄位**：值` 的整段文字），
+   文件由 943 KB 降到 909 KB，頁面也能一行一個事實呈現。
+5. **不修** `market_screen_picks` 的同日重複入選（見下），只去重並揭露。
+
+**Why**:
+- 歷史是「清單」這種每日替換型產物唯一能被稽核的證據；沒有它，
+  任何績效宣稱都只能用當日截圖
+- `market_screen_picks` 沒有 `(run_id, ticker)` 唯一鍵，實測 17 天、20 組同一檔在同一次
+  篩選被寫入兩次；那些天的 24 筆其實只有 23 個不重複標的，而
+  `publish_manifest.fetch_picks()` 只檢查列數所以查不出來。
+  本功能以 `(run_id, ticker)` 去重（保留 id 最小者）並在頁面與 JSON 揭露天數，
+  但**沒有**加唯一鍵、沒有回寫既有列、沒有改 market screen——
+  那要先查清楚為什麼會重複入選，屬於另一個需要單獨授權的修正。
+- 認證契約（`validate_all_reports`）對產物集合是嚴格相等比對，
+  新增檔案若不同步白名單會讓 nightly 認證失敗，因此改動必須成對進行
+
+**Trade-off**:
+- 歷史文件每晚重建，main 會有滾動 diff（與既有的 `chips-history-index.json` 同一模式）
+- JSON 909 KB（緊湊 JSON，GH Pages 會 gzip，實際傳輸約 180 KB）
+- 只涵蓋 `market_screen_runs` 保留的期間（目前 2026-08-12 起 50 次）；更早的清單無 DB 紀錄
+
+**驗證**:
+- `tests/test_watchlist_history.py`：6 個測試（理由解析、同日去重、認證身分、
+  緊湊輸出、產物白名單、頁面契約、台股顏色）
+- 全套 `pytest tests/`：235 passed / 1 failed；唯一失敗
+  `test_db_config.py::test_missing_password_fails_closed` 為**既有失敗**
+  （`scripts/db_client.py` 有他人未提交的 registry fallback 改動；
+  以 HEAD 版本隔離驗證為 3 passed），與本功能無關
+- 瀏覽器實測（487×767 手機視窗）：總覽表、下鑽抽屜、報酬圖、理由逐行、
+  深層連結、去重後次數皆正確
+- 詳見 `docs/WATCHLIST_HISTORY_FEATURE.md`
+
