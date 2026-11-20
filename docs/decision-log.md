@@ -555,7 +555,7 @@ run，但補算窗口只剩 22:25 之前。
    先在 11/16 的真值上做唯讀驗算（差異僅為欄位小數位進位），再用上游
    `recompute_derived()` 對 5 檔抽樣交叉驗證（逐欄 0 差異）。不呼叫 FinMind API、
    不改 schema、不動其他欄位。
-2. **補結構性漏洞**（Walter 授權選項 A，local-only 未 push）：在
+2. **補結構性漏洞**（Walter 授權選項 A；當時 local-only 未 push，現已在遠端 `2a3808aa3`）：在
    `AI-Telegram/strategy_lab/finmind_batch_update.py` 新增 `tickers_missing_derived()`，
    資料集階段改為 `try/except` 記錯但不中斷，補算條件由 `touched_dates and "price" in phase_names`
    改為只看 `"price" in phase_names`（`touched_tickers` 為空時用佔位值偵測兜底），
@@ -579,6 +579,9 @@ run，但補算窗口只剩 22:25 之前。
 **Trade-off**:
 - 修補只在 local，未 push；且該檔另有他人未提交的改動（`official_twse_json`／
   `capital_suspensions`／`resolve_price_universe`），**不可整檔 commit**，必須逐 hunk 取用
+  （**2026-11-20 更新**：此條的狀態註記已過期。`tickers_missing_derived` 與上述三個符號
+  都已在遠端 `2a3808aa3` 裡；`strategy_lab/finmind_batch_update.py` 目前的工作樹差異是**他人**
+  的未提交內容，仍然不可整檔 commit。決策內容本身不變。）
 - `chipscore_daily` 沒有最新交易日（11/16 的篩選也是 `chipscore: 0`）是**天天如此**的
   結構性缺口，本次未處理，short 分數的 chip 來源仍長期缺料
 - `tickers_missing_derived` 用 `sma_13 = 0` 當佔位值訊號，極少數 Close 全為 0 的列會被
@@ -847,3 +850,78 @@ tw-invest-suite-daily-report（就是 nightly 本體，21:30 觸發）在 11/19 
 - 05:00 的 catchup 以 `run_daily.ps1 -Force` 重跑整條並重新認證，隨後發布；
   Groove 與 Telegram 收據隨之更新（結果見 `docs/RESP-2026-11-20-01-nightly-failure-root-cause-and-recovery.md`）。
 - 詳見 `docs/RESP-2026-11-20-01-nightly-failure-root-cause-and-recovery.md`
+## D025: 閘門要用模型自己的期限評估；門檻先不動，先補特徵管線
+
+**日期**：2026-11-20
+
+**Context**:
+出發點是「重算閘門門檻」。複查後發現兩件事擋在前面：
+
+1. **期限錯配**。production 模型是 20 日模型（`p_win20_net_1pct`／`p_big_loss20`／
+   `pred_net_return`），但前瞻驗證 ledger 只實作 `horizon_5d`／`horizon_10d`。
+   **閘門從來沒有用它自己的期限被評估過**：ledger 只記 5d 與 10d。
+   同一列組（quality_ok ∧ 現行閘門 ∧ 有 20 日結果的預測日 → 78 列、2 個預測日）上：
+   ADD 超額 5 日 +2.71pp、10 日 +0.41pp、20 日 +7.51pp（三個期限都贏過市場），
+   但**絕對報酬** 5 日 −2.12%、10 日 +1.31%、20 日 −3.59%。
+   只看 ledger 現有的 5d／10d，會把這批訊號讀得比實際好——10 日是唯一顯示正絕對報酬的期限。
+2. **樣本不足**。改到 20 日期限後，22 個有完整 20 日結果的交易日裡，現行閘門只在
+   **2 天**觸發 ADD（2026-06-18／06-22，共 78 列）＝閘門自身 4,892 列的 1.6%。
+   78 列、2 天、同一個崩盤 regime，不足以定任何門檻。
+
+追下去發現真正的病因在上游：**三個特徵管線缺口**（chip／us_anchor／news），
+以及 `p_big_loss20` 的當日 floor 在相鄰日擺動 13 倍（0.033~0.432），
+使整帳在 ADD 與 REDUCE 之間翻面——**閘門是症狀，管線是病因。**
+
+**Decision**:
+1. **閘門門檻不動**（`min_win_prob=0.50`／`max_loss_prob=0.98`）。
+   在模型自己的期限上只有 78 列可用，任何門檻都是過度配適；
+   而把門檻放寬以提高樣本，恰好會放大全帳翻轉的日子。
+2. **先修證據層**：ledger 增加 20 日期限（`horizon_20d_status`／`return_20d` 等），
+   摘要與 `by_action` 同步輸出 10 日與 20 日。**評估閘門前先確認 ledger 的期限 == 模型的期限。**
+3. **先修特徵管線**：用官方建置器 `data-downloader/stock_chip_features.py`
+   以 `--source-table daily_data2_full` 重建 2020-01-02~2026-06-11 的歷史區段，
+   補上 live 視窗缺列的 37 天；補 `us_anchor_features_daily` 的 2026-06-22~09-30；
+   以本地 `stock_news` 原料庫重建 live 視窗的新聞特徵。
+4. **加覆蓋率守門（fail-closed）**：推論當日 chip 覆蓋率低於
+   `daily_prediction.min_source_coverage`（0.95）→ 該族特徵視為缺漏、
+   **當日不發布任何 ADD**、收據記 `coverage_gate`。
+5. **重訓但不推廣**：依 RESP-2026-11-12-01 §5.2 的規格重訓（train 2023-01-01~2026-03-31、
+   validation 2026Q2、playback 2026-06-18~11-12），**沿用生產特徵集**以便一對一比較；
+   線上 bundle 不換，推廣另需授權且要滿足 RESP-2026-11-12-01 §5.3 的門檻。
+
+**Why**:
+- 閘門要評的是 20 日的東西，ledger 卻只給 5 日與 10 日的答案：同一列組的絕對報酬
+  5 日 −2.12%、10 日 +1.31%、20 日 −3.59%，只看前兩個期限會讀得比實際好。
+  在這種情況下調參數等於在錯誤的座標系裡找答案。
+- 「78 列、2 天」是硬上限：閘門只在市場最糟的兩天開過，那些天的樣本不能代表
+  閘門在正常市場下的行為。放寬門檻會讓樣本變多，但每一個新增樣本都來自
+  `big_loss20` floor 抬高日的全帳翻轉，**會把最糟的行為學成規則**。
+- 特徵管線的缺口才是可修的東西，而且修完之後，模型才第一次在「訓練與服務同一個分布」
+  的條件下被評估。RESP-2026-11-12-01 §5.1 已經寫明：**P1～P3 完成前重訓是浪費**。
+- 覆蓋率守門是 2026-11-12 稱為「最惡劣失效模式」的那一個
+  （管線故障 → 閘門全開 → 在最糟的日子造成最大損失），
+  而它「可以在發佈前被擋掉」——所以擋掉比調參數優先。
+
+**Trade-off**:
+- 門檻維持現值，等於承認目前**沒有可用的閘門**；在新的新鮮前瞻驗證累積夠之前，
+  線上的 ADD 清單仍可能整日翻轉（但現在會被覆蓋率守門擋掉退化日）。
+- 20 日期限要多 20 個交易日的資料才會完成，ledger 的 `pending_20d` 會長期偏高；
+  這是誠實反映「模型還沒被自己的期限驗證過」，不是缺陷。
+- 重訓用了 RESP-2026-11-12-01 §5.2 的三年視窗（924 個交易日、約 106 萬列），記憶體與時間成本都高於
+  原來的一年視窗；但只有把 chip 覆蓋率拉平，這個視窗才有訓練價值。
+- 新聞家族的原料庫重建會讓 live 視窗的新聞密度（~70 檔/日）高於訓練窗（平均 16.3 檔/日），
+  這是兩條收集路徑密度不同造成的；要完全對齊需要把訓練窗也用原料庫重建（924 天，約 7.7 小時），
+  或把新聞整族排除在特徵集之外。兩者都需要另外的授權。
+
+**驗證**:
+- chip 覆蓋率：train 11.4% → **98.9%**、validation 11.3% → **99.0%**、
+  live → **98.9%**（天數也補齊）；整張表（2026-11-20 14:40 量測）
+  **3,646,918 列／1,664 日／2,626 檔**、單一 `data_source='daily_data2_full'`，
+  legacy 的 418,327 列／273 檔殘表清空。
+- us_anchor：live 視窗 39/97 → **97/97**。
+- news：live 視窗 41/97 → 補齊（原料庫重建）；單日驗證 2026-06-25 由 1 檔變 72 檔。
+- 覆蓋率守門：以 `data_policy.local.json` 把門檻暫時設成 1.01（不可能值）做受控驗證，
+  確認 `coverage_gate` 被寫入且當日不發布 ADD；驗證後移除覆寫。
+- ledger 20 日期限：`pytest test_forward_validation_refresh.py test_forward_validation_coverage.py`
+  → 20 passed。
+- 重訓結果與與現任模型的對照見 `docs/RESP-2026-11-20-02-gate-evidence-and-feature-pipeline-repair.md` §4。
