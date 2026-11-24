@@ -254,27 +254,38 @@ source_hashes OK: 72 files
 
 ### 4.4 實體睡眠喚醒：上次的真因找到了，但這台機器做不到
 
-上次的 arm 任務（11/21 23:35）寫了收據卻**沒有真的睡**。真因有兩個：
+上次的 arm 任務（11/21 23:35）寫了收據卻**沒有真的睡**。真因有三層，前兩層是我的錯，第三層是環境事實：
 
 1. **用錯 API**。原腳本廣播 `WM_SYSCOMMAND` / `SC_MONITORPOWER`（0xF170）——
    那是「**關螢幕**」指令，不是休眠。已改成真正的
    `SetSuspendState(FALSE, TRUE, FALSE)`（S3）。
-2. **權杖被 UAC 過濾**。`whoami /priv` 顯示 `SeShutdownPrivilege` 存在但 Disabled，
-   但 `AdjustTokenPrivileges` 回 **win32=5（ACCESS DENIED）**——
-   非提升權杖是 UAC 過濾權杖（`BUILTIN\Administrators` = *deny only*），
-   這個權限啟用不了。`Set-ScheduledTask -RunLevel Highest` 也回 **Access is denied**。
+2. **權杖存取遮罩錯了**。`AdjustTokenPrivileges` 需要
+   `TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY`，只開前者會回 ERROR_ACCESS_DENIED。
+   另外 `GetLastError` 必須在原生呼叫內部讀取（受控執行階段會覆寫執行緒的 last error，
+   在外面讀會拿到 203 這種假值）。兩處都已修。
+3. **真正的阻擋：這個權杖啟用不了 SeShutdownPrivilege。**
+   `GetTokenInformation(TokenPrivileges)` 的實測：權杖裡 SeShutdownPrivilege **存在**
+   （luid 19:0）但 **attributes = 0x0**（未啟用）；`AdjustTokenPrivileges` 回
+   **ERROR_ACCESS_DENIED**，且調整後權杖清單**完全沒變**。
+   這在**升權權杖裡一樣**（`IsInRole(Administrator)=True`、arm／wake 兩個排程都已改成
+   `Run with highest privileges`），所以不是 UAC 過濾造成的。
 
-⇒ **受控休眠需要提權的排程**，這台 session 做不到。
+⇒ **這台機器用 API 無法被 suspend**。`shutdown /h`、`SetSuspendState`、
+`NtSetSystemPowerState` 全都要求同一個權限。剩下的可能只有：
+(a) 帳號的「關閉系統 / Shut down the system」使用者權限被拒（`secpol.msc` →
+使用��權限指派 → 檢查「拒絕關閉系統」）；(b) 由**人**從開始選單送一次睡眠
+（使用者介面路徑不經過使用者的權杖），然後靠 `WakeToRun` 的排程喚醒。
+
 喚醒能力本身是備妥的：`powercfg /devicequery wake_armed` 列出兩張 **Intel I210 網卡**
 （wake-on-LAN 已啟用）、`powercfg /a` 有 S3 與休眠；缺的是「誰來按下休眠」。
 
-腳本已改成會**大聲失敗**而不是靜默假成功：`-Mode verify` 直接回報權杖能不能用，
-arm 任務在沒有核准的測試時回 0（正常狀態，不是紅字），有核准但提權不足時寫
-`status: suspend_unavailable` 並回 4。
+腳本已改成會**大聲失敗**而不是靜默假成功：`-Mode verify` 回報權杖能不能用，
+arm 任務在沒有核准的測試時回 0（正常狀態，不是紅字），有核准但權限不足時寫
+`status: suspend_unavailable` 並附上真實 win32 碼。2026-11-24 09:32 以升權 arm 任務
+實跑的結果就是上面那一行——**畫面沒有黑、機器沒有睡，收據說明了原因**。
 
-**待 Walter 決定**：在有提權權限的 session 裡把 arm 任務改成「使用最高權限執行」，
-就能做真正的受控睡眠 → 喚醒 → 證明。若不升權，本機的實體睡眠喚醒**維持未證明**，
-這是誠實的現況，不是缺陷。
+**待 Walter 決定**：是否查帳號的「關閉系統」權限（或以人工睡眠 + WakeToRun 排程做一次
+有人盯著的受控測試）。在此之前本機的實體睡眠喚醒**維持未證明**，這是誠實的現況。
 
 ---
 
@@ -336,6 +347,22 @@ marker 內容：`run_id 119`、`picks 24`、`artifacts 2,037`、`render_count 1,
 但 publication 的 nightly_id 仍必須與 marker 相等、marker 的 data_date／marker_version／
 status 全部照舊。週末認證因此**不會**讓 hourly catchup 判定「未認證」而每小時重跑整條 nightly。
 
+**2026-11-23 補的洞**：21:30 那一輪的繼承鏈已經斷了一層——
+`inherited_maintenance_nightly_id` 只指到「上一輪的 nightly_id」，而維護收據的 nightly_id
+還在三代之前（37e9e86f → adbf6c6c → 0ddf225e → ba47dae5）。稽核若只比對「marker 或其直接
+上一輪」就會誤報 `canonical maintenance identity 不一致`（實際上 catchup 判定已認證）。
+已改成**三處共用同一個 `maintenance_claim_holds()`**：同一輪／繼承／**現存摘要相同**——
+第三路（marker 的 `canonical_inputs_sha256` 等於資料庫當下的摘要）不受世代影響。
+修正後：canonical 由 `unverified` 回到 **verified**，audit 只剩睡眠喚醒那一項。
+
+### 5.5 發佈到線上的實測（2026-11-23 13:50）
+
+`groovelab.dev/data/publish_manifest_2026-11-20.json` 與
+`walterliu168.github.io/tw-invest-suite/data/publish_manifest_2026-11-20.json`
+都回 `nightly_id = ba47dae5a916447e9d3288000bae1b6a`、2,037 個產物；
+`groovelab.dev/watchlist.html` 為 2026-11-20、2.18 MB、84 張 pick 卡；
+`git ls-remote origin gh-pages` 的 HEAD 與 `publication_result.json` 的 `status_commit` 一致。
+
 ### 5.5 其他排程的實測
 
 | 排程 | 實測 |
@@ -363,3 +390,35 @@ status 全部照舊。週末認證因此**不會**讓 hourly catchup 判定「�
     **不驗磁碟上的產物雜湊**。11/21 那次「render 已改寫 1,974 個檔、認證卻沒完成」的情況，
     catchup 完全沒有察覺（它到 11/22 15:00 都還回 ALREADY_CERTIFIED）。
     這是 manifest 漂移能持續兩天的原因，值得另案處理。
+
+---
+
+## §6.1 2026-11-23 的兩項決定與一個新發現
+
+**決定一：AI-Telegram 管線的鎖，先 pass（Walter，2026-11-23 13:49）。**
+
+`D:\CODEX\AI-Telegram\output\pipeline_state\scheduler.lock` 被一個 **2026-10-9 建立、
+Session 0、CPU 0 秒**的行程（PID 2976）握住，**45 天沒有釋放**。後果是每個
+`run_pipeline_scheduled.py` 都在 1 秒內退出 "another scheduler is already running"——
+AI-Telegram 的 18:00 canonical 下載、22:00 籌碼／FinFill、22:12 ranking、22:32 review、
+22:47／23:02 報告與策略調整、22:42 海外市場**全部沒有在跑**；owner 行程只是每分鐘寫一次
+心跳。該行程無提權殺不掉（Access denied），`Set-ScheduledTask -RunLevel Highest` 也被拒。
+
+- **不動它**（決定）。要復活只需把 `scheduler.lock` 改名，讓下一輪拿到新鎖（可逆）；
+  風險是萬一那隻僵屍醒來會有兩個 scheduler（它 45 天 CPU 0，機率極低）。
+- **影響範圍**：**tw-invest-suite 那條認證鏈不受影響**——它自己的 `finmind_maint` 會刷新
+  canonical 資料（11/22 21:30 的 nightly 全綠就是證據）。受影響的是 AI-Telegram 自己的
+  模型預測、ranking、review 與報告仍停在舊資料。
+- 註：watchdog 的「owner 活著」判斷只看心跳，所以它不會誤判也不會誤動；
+  但也代表**心跳活著不等於管線有做事**（這是 watchdog 目前的盲點）。
+
+**決定二：22:50 發佈的紅字，接受（Walter，2026-11-23 13:49，條件＝能發佈到 groovelab）。**
+
+`tw-invest-suite-publish` 11/22 22:50 → rc=1 且**沒有留下 publish log**（腳本在等待迴圈與
+`pipeline_state.py verify` 之後才建立日誌）→ 死在 publish 階段之前；`daily-report` 任務在
+00:09:55 正常結束（LastTaskResult=0），所以不是 deadline 路徑；剩下的唯一失敗點是當下
+`pipeline_state.py verify` 回非零，而現在跑是 exit 0 → 暫態／並行狀態，已不可重現。
+`TaskScheduler/Operational` 記錄未啟用，沒有可回放的證據。
+
+**接受理由**：發佈本身正常——catchup 的 publish-only 在 01:01／09:01／11:01／13:01
+四次全部 exit 0，且兩個線上站點都已在服務認證後的版本（§5.5）。因此不追這個紅字。
